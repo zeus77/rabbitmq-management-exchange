@@ -8,10 +8,10 @@
 -module(rabbit_exchange_type_management).
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include_lib("rabbit_common/include/rabbit_framing.hrl").
-
+-include_lib("rabbit/include/mc.hrl").
 -behaviour(rabbit_exchange_type).
 
--export([description/0, serialise_events/0, route/2]).
+-export([description/0, serialise_events/0, route/2, route/3]).
 -export([validate/1, validate_binding/2,
          create/2, delete/2, policy_changed/2,
          add_binding/3, remove_bindings/3, assert_args_equivalence/2]).
@@ -37,9 +37,12 @@ description() ->
 
 serialise_events() -> false.
 
-route(#exchange{name = #resource{virtual_host = VHost}},
-      #delivery{message = #basic_message{routing_keys = Keys,
-                                         content      = Content0}}) ->
+route(Exchange, _Message) ->
+    route(Exchange, _Message, #{}).
+
+route(#exchange{name = #resource{virtual_host = VHost}},Msg,_Opts) ->
+    Keys = mc:routing_keys(Msg),
+    Content0 = mc:protocol_state(mc:convert(mc_amqpl, Msg)),
     #content{properties            = #'P_basic'{reply_to       = ReplyTo,
                                                 type           = Method,
                                                 correlation_id = Id},
@@ -51,6 +54,7 @@ route(#exchange{name = #resource{virtual_host = VHost}},
               end,
     [handle_rpc(Method, K, Id, VHost, ReplyTo, Payload) || K <- Keys],
     []. %% Don't route anything!
+
 
 validate(_X) -> ok.
 
@@ -87,11 +91,12 @@ handle_rpc(Method, Path, Id, VHost, ReplyTo, ReqBody) ->
                        type           = list_to_binary(integer_to_list(Code)),
                        content_type   = <<"application/json">>},
             Content = rabbit_basic:build_content(Props, [list_to_binary(ResBody)]),
-            {ok, Msg} = rabbit_basic:message(rabbit_misc:r(VHost, exchange, <<>>),
-                                             ReplyTo, Content),
-            _ = rabbit_basic:publish(rabbit_basic:delivery(false, false, Msg, undefined)),
+            ExchangeDst = rabbit_misc:r(VHost, exchange, <<>>),
+            {ok, Msg} = mc_amqpl:message(ExchangeDst, ReplyTo, Content),
+            _ = rabbit_queue_type:publish_at_most_once(ExchangeDst,Msg),
             ok;
         {error, Reason} ->
+            error_logger:info_msg("Management exchange error:~p~n ",Reason),
             exit({error, Reason})
     end.
 
